@@ -1,0 +1,155 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+#data incubator proposal using JUST capitol data from 
+#https://blog.thedataincubator.com/2017/04/just-capital-and-data-incubator-challenge/#more-1348
+
+#load required packages
+require(readxl)
+require(dplyr)
+require(tmaptools)
+require(tmap)
+require(leaflet)
+require(htmlwidgets)
+
+#read in selected data for health and census information
+health_rankings_raw <- read_excel("DataInc/JUST_project/HEALTH_DATA.xls", sheet = 3, col_names = TRUE)
+health_data_raw <- read_excel("DataInc/JUST_project/HEALTH_DATA.xls", sheet = 4, col_names = TRUE)
+census_raw <- read_excel("DataInc/JUST_project/CENSUS_DATA.xls", col_names = TRUE, skip = 2)
+
+#format health data into usable data frames
+health_rankings <- health_rankings_raw[2:nrow(health_rankings_raw),-grep("X_", names(health_rankings_raw))]
+health_rankings <- cbind(health_rankings, health_rankings_raw[2:nrow(health_rankings_raw),1])
+names(health_rankings) <- c(names(health_rankings)[1:6],"FIPS")
+health_rankings[health_rankings == "NR"] <- NA
+health_rankings <- as.data.frame(sapply(health_rankings, as.numeric))
+health_data <- health_data_raw[2:nrow(health_data_raw),-grep("X_", names(health_data_raw))]
+names(health_data) <- health_data_raw[1,-grep("X_", names(health_data_raw))]
+
+#create table of fips id state and county names
+fips_id <- health_data_raw[2:nrow(health_data_raw),1:3]
+names(fips_id) <- health_data_raw[1,1:3]
+
+#format census data
+census <- census_raw[2:nrow(census_raw),-grep("X_", names(census_raw))]
+names(census) <- census_raw[1,-grep("X_", names(census_raw))]
+census$FIPS <- paste(census_raw$`Geographic Information`, census_raw$X__1, sep = "")[2:nrow(census_raw)] 
+census <- census[,2:7]
+
+#format company data
+companies_raw <- read_excel("DataInc/JUST_project/COMPANY_DATA.xlsx", col_names = TRUE)
+companies <- companies_raw[,c(1,2,3)]
+names(companies) <- c("FIPS", "id", "weight")
+
+#remove variables that are no longer needed
+rm('health_data_raw', 'census_raw', 'health_rankings_raw', 'companies_raw')
+gc()
+
+#merge into one large data set and then remove everything else
+all_data <- merge(fips_id, companies, by.y  = "FIPS")
+all_data <- merge(all_data, health_rankings, by.x = "FIPS")
+all_data <- merge(all_data, census, by.x = "FIPS")
+#will eventually add in raw data for health - all_data <- merge(all_data, health_data, by = "FIPS")
+
+#remove columns that don't contain numeric data
+numeric_data <- all_data[, -which(names(all_data) %in% c("Unreliable", "Poverty Estimate, Age 0-4", 
+                                                     "Poverty Estimate, Age 5-17 in Families", 
+                                                     "Poverty Estimate, Age 0-17", "State", "County"))]
+#change columns from character class to numeric and test for NAs
+numeric_data <- as.data.frame(sapply(numeric_data, as.numeric)) 
+sum(!complete.cases(numeric_data)) #only 14 rows have missing data - removed below
+numeric_data <- numeric_data[complete.cases(numeric_data),]
+names(numeric_data) <- c(names(numeric_data)[1:3], "life_length", "life_quality", "health_beh", "clinical_care",
+                               "social_econ_factors", "phys_envir", "poverty_est", "median_income")
+
+#remove variables that are no longer needed
+rm('health_data', 'census', 'health_rankings', 'companies', 'fips_id')
+gc()
+
+#average data by county code
+avg_by_FIPS <- dplyr::summarize(group_by(numeric_data, FIPS), mean_weight = mean(weight),
+                                mean_life_length = mean(life_length), mean_life_qual = mean(life_quality),
+                                mean_health_beh = mean(health_beh), mean_clinical_care = mean(clinical_care),
+                                mean_soc_ec_factors = mean(social_econ_factors), mean_poverty = mean(poverty_est),
+                                mean_income = mean(median_income))
+
+#seperate out only data for mean + 2*sd of weights
+weight_cutoff <- mean(avg_by_FIPS$mean_weight) + 2*sd(avg_by_FIPS$mean_weight)
+avg_by_FIPS <- avg_by_FIPS[avg_by_FIPS$mean_weight <= weight_cutoff,]
+
+#scaled data (dsubtract mean and divide by sd of each column) 
+scaled_data <- as.data.frame(scale(as.matrix(avg_by_FIPS[,2:ncol(avg_by_FIPS)]))) 
+
+#mapping over the US - downloaded shape files from https://www.census.gov/geo/maps-data/data/cbf/cbf_counties.html
+usgeo <- read_shape(file = "DataInc/JUST_project/cb_2016_us_county_5m/cb_2016_us_county_5m.shp")
+
+#remove geo data that does not have corresponding JUST data
+usgeo@data$FIPS <- paste(as.character(usgeo@data$STATEFP), as.character(usgeo@data$COUNTYFP), sep = "")
+relevant_usgeo <- usgeo[usgeo@data$FIPS %in% avg_by_FIPS$FIPS,]
+
+#merge data - make sure id columns to merge are same format and order
+scaled_data$FIPS <- as.character(avg_by_FIPS$FIPS)
+scaled_data <- scaled_data[order(scaled_data$FIPS),]
+relevant_usgeo <- relevant_usgeo[order(relevant_usgeo@data$FIPS),]
+
+#combined data frames
+avgdata_map <-  append_data(relevant_usgeo, scaled_data, key.shp = "FIPS", key.data="FIPS")
+
+#remove unused variables
+rm("usgeo", "state_fips", "county_fips", "all_data", "numeric_data", "data_for_cor")
+gc()
+
+#find min and max in data set
+minpt <- min(scaled_data[,1:8])
+maxpt <- max(scaled_data[,1:8])
+
+#create palletes for desired variables - starting with company weight, poverty, income, quality of life,
+#health behavior, and clinical care
+weight_pal <- colorNumeric(palette = "BuPu", domain = c(minpt,maxpt), na.color = "white")
+poverty_pal <- colorNumeric(palette = "Reds", domain = c(minpt,maxpt), na.color = "white")
+income_pal <- colorNumeric(palette = "PuRd", domain = c(minpt,maxpt), na.color = "white")
+lifequal_pal <- colorNumeric(palette = "Greens", domain = c(minpt,maxpt), na.color = "white")
+health_pal <- colorNumeric(palette = "Oranges", domain = c(minpt,maxpt), na.color = "white")
+clinical_pal <- colorNumeric(palette = "YlOrRd", domain = c(minpt,maxpt), na.color = "white")
+grey_pal <- colorNumeric(palette = "Greys", domain = c(minpt,maxpt), na.color = "white")
+  
+my_popup <- paste0("Company Weight: ", avgdata_map@data$mean_weight, 
+                   "Poverty: ", avgdata_map@data$mean_poverty,
+                   "Median Income: ", avgdata_map@data$mean_income,
+                   "Quality of Life: ", avgdata_map@data$mean_life_qual,
+                   "Health Behaviors: ", avgdata_map@data$mean_health_beh,
+                   "Clinical Care: ", avgdata_map@data$mean_clinical_care)
+
+#create interactive map by adding polygons for each data set, an overall scaling legend, and layers control 
+interactive_map <- leaflet(avgdata_map) %>% addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~weight_pal(avgdata_map@data$mean_weight), group = "Company Justness") %>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~poverty_pal(avgdata_map@data$mean_poverty), group = "Poverty")%>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~income_pal(avgdata_map@data$mean_income), group = "Income")%>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~lifequal_pal(avgdata_map@data$mean_life_qual), group = "Life Quality")%>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~health_pal(avgdata_map@data$mean_health_beh), group = "Health Behavior")%>%
+  addPolygons(stroke = FALSE, weight = 1, smoothFactor = 0.2, fillOpacity = 0.8, popup = my_popup,
+              color = ~clinical_pal(avgdata_map@data$mean_clinical_care), group = "Clinical Care") %>%
+  addLegend(position = "bottomleft", pal=grey_pal, values=avgdata_map@data$mean_weight, title="Scaling") %>%
+  addLayersControl(baseGroups = c("Company Justness", "Poverty", "Income", "Life Quality", "Health Behavior",
+                                  "Clinical Care"), position = "bottomright", 
+                   options = layersControlOptions(collapsed = FALSE))
+
+#visualize and save map
+interactive_map
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
